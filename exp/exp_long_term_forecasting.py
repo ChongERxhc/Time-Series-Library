@@ -37,7 +37,28 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def _select_criterion(self):
         criterion = nn.MSELoss()
         return criterion
- 
+
+    def _select_output_dims(self, outputs, batch_y):
+        f_dim = -1 if self.args.features == 'MS' else 0
+        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+        eval_dims = getattr(self.args, 'eval_dims', 0)
+        if eval_dims > 0 and self.args.features != 'MS':
+            outputs = outputs[:, :, :eval_dims]
+            batch_y = batch_y[:, :, :eval_dims]
+        return outputs, batch_y
+
+    def _select_output_dims_np(self, outputs, batch_y):
+        f_dim = -1 if self.args.features == 'MS' else 0
+        outputs = outputs[:, :, f_dim:]
+        batch_y = batch_y[:, :, f_dim:]
+
+        eval_dims = getattr(self.args, 'eval_dims', 0)
+        if eval_dims > 0 and self.args.features != 'MS':
+            outputs = outputs[:, :, :eval_dims]
+            batch_y = batch_y[:, :, :eval_dims]
+        return outputs, batch_y
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -59,9 +80,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                outputs, batch_y = self._select_output_dims(outputs, batch_y)
 
                 pred = outputs.detach()
                 true = batch_y.detach()
@@ -77,6 +96,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        # vali_data, vali_loader = self._get_data(flag='test')
+        # test_data, test_loader = self._get_data(flag='val')
+        # feature_std = train_data.scaler.scale_
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -116,17 +138,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        outputs, batch_y = self._select_output_dims(outputs, batch_y)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    outputs, batch_y = self._select_output_dims(outputs, batch_y)
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
 
@@ -167,6 +185,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
+        # test_data, test_loader = self._get_data(flag='val')
         if test:
             print('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
@@ -208,8 +227,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = test_data.inverse_transform(outputs.reshape(shape[0] * shape[1], -1)).reshape(shape)
                     batch_y = test_data.inverse_transform(batch_y.reshape(shape[0] * shape[1], -1)).reshape(shape)
 
-                outputs = outputs[:, :, f_dim:]
-                batch_y = batch_y[:, :, f_dim:]
+                outputs, batch_y = self._select_output_dims_np(outputs, batch_y)
 
                 pred = outputs
                 true = batch_y
