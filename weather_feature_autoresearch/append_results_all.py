@@ -10,7 +10,30 @@ from pathlib import Path
 
 WORK_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = WORK_DIR / "results_all.tsv"
-DEFAULT_HORIZONS = [96, 192, 336, 720]
+DEFAULT_HORIZON = 96
+
+RESULT_FIELDNAMES = [
+    "utc_iso",
+    "commit",
+    "feature_set_name",
+    "feature_fp",
+    "n_features",
+    "input_dim",
+    "eval_dims",
+    "pred_len",
+    "baseline_val_mse",
+    "val_mse",
+    "val_improve",
+    "score",
+    "best_score_before",
+    "status",
+    "test_mse",
+    "test_mae",
+    "dirty",
+    "description",
+    "log_file",
+    "staging_csv",
+]
 
 
 def parse_log(path: Path) -> dict[str, str]:
@@ -56,6 +79,13 @@ def best_score_before(results_path: Path) -> float:
 
 def ensure_header(path: Path, fieldnames: list[str]) -> None:
     if path.exists() and path.stat().st_size > 0:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            existing = f.readline().strip().split("\t")
+        if existing != fieldnames:
+            raise RuntimeError(
+                f"{path} has legacy columns; rename or archive it before using the new schema. "
+                f"Expected header starting with: {fieldnames[:6]}..."
+            )
         return
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
@@ -67,8 +97,12 @@ def main() -> None:
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--description", default="")
     parser.add_argument("--results", type=Path, default=RESULTS_FILE)
-    parser.add_argument("--min-improve", type=float, default=0.001)
-    parser.add_argument("--horizons", type=int, nargs="+", default=DEFAULT_HORIZONS)
+    parser.add_argument(
+        "--min-improve",
+        type=float,
+        default=0.0,
+        help="Minimum score margin over historical best to mark keep (default 0: any strict improvement).",
+    )
     args = parser.parse_args()
 
     parsed = parse_log(args.log)
@@ -84,52 +118,32 @@ def main() -> None:
     commit = git_output(["git", "rev-parse", "HEAD"])
     dirty = "1" if git_output(["git", "status", "--porcelain"]) else "0"
 
-    fieldnames = [
-        "utc_iso",
-        "commit",
-        "feature_set_name",
-        "input_dim",
-        "eval_dims",
-        "score",
-        "best_score_before",
-        "status",
-        "positive_horizons",
-        "avg_mse_improve",
-        "avg_mae_improve",
-    ]
-    for horizon in args.horizons:
-        fieldnames.extend([
-            f"mse_{horizon}",
-            f"mae_{horizon}",
-            f"mse_improve_{horizon}",
-            f"mae_improve_{horizon}",
-        ])
-    fieldnames.extend(["dirty", "description", "log_file", "generated_data"])
-
     row = {
         "utc_iso": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": commit,
         "feature_set_name": parsed.get("feature_set_name", ""),
+        "feature_fp": parsed.get("feature_fp", ""),
+        "n_features": parsed.get("n_features", ""),
         "input_dim": parsed.get("input_dim", ""),
         "eval_dims": parsed.get("eval_dims", ""),
+        "pred_len": parsed.get("pred_len", str(DEFAULT_HORIZON)),
+        "baseline_val_mse": parsed.get("baseline_val_mse", ""),
+        "val_mse": parsed.get("val_mse", ""),
+        "val_improve": parsed.get("val_improve", ""),
         "score": parsed.get("score", ""),
         "best_score_before": "" if best_before == float("-inf") else f"{best_before:.10g}",
         "status": status,
-        "positive_horizons": parsed.get("positive_horizons", ""),
-        "avg_mse_improve": parsed.get("avg_mse_improve", ""),
-        "avg_mae_improve": parsed.get("avg_mae_improve", ""),
+        "test_mse": parsed.get("test_mse", ""),
+        "test_mae": parsed.get("test_mae", ""),
         "dirty": dirty,
         "description": args.description,
         "log_file": str(args.log),
-        "generated_data": parsed.get("generated_data", ""),
+        "staging_csv": parsed.get("staging_csv", ""),
     }
-    for horizon in args.horizons:
-        for key in ("mse", "mae", "mse_improve", "mae_improve"):
-            row[f"{key}_{horizon}"] = parsed.get(f"{key}_{horizon}", "")
 
-    ensure_header(args.results, fieldnames)
+    ensure_header(args.results, RESULT_FIELDNAMES)
     with args.results.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer = csv.DictWriter(f, fieldnames=RESULT_FIELDNAMES, delimiter="\t")
         writer.writerow(row)
 
     print(f"appended: {args.results}")

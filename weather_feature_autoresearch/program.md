@@ -46,13 +46,20 @@
 
 Phase A（仅 setup，不得开始特征挖掘 / trial）：
 
-1) 先创建当天实验分支（orphan）
-- 标签用 YYYYMMDD-weather（如 20260512-weather），分支名：autoresearch/<tag>
-- 在仓库根目录（Time-Series-Library）执行：
-  git checkout --orphan autoresearch/<tag>
+1) 创建当天 orphan 实验分支（每次新会话一条 orphan 线）
+- 标签用 YYYYMMDD-weather（如 20260518-weather），分支名：`auto/<tag>`
+- **硬规则：创建 orphan 之前不要切换分支**——禁止先 `git checkout main`、`git checkout master` 或其它非实验分支；在**当前所在分支**（通常为 `autoresearch` 或上一轮 `auto/<旧tag>`）上**直接**执行 `--orphan`，不要绕道 `main`。
+- **创建前检查**（在仓库根目录）：
+  - `git branch --show-current` 不得为 `main` / `master`。
+  - 若当前在 `main`/`master`：先 `git checkout autoresearch`（或上一实验 orphan 分支），**再**创建新 orphan；**禁止**从 `main` 上执行 `git checkout --orphan`。
+- **创建命令**（确认不在 `main`/`master` 后）：
+  ```bash
+  git checkout --orphan auto/<tag>
   git reset
   git add .
-  git commit -m "chore: init autoresearch/<tag> root commit"
+  git commit -m "chore: init auto/<tag> root commit"
+  ```
+- Phase A / Phase B 的 baseline 与 trial 均在本次 **`auto/<tag>`** orphan 分支上进行（与 `main`/`master` 无共同祖先）。
 
 2) 历史可见性约束（硬规则）
 - 禁止：git log --all、git reflog、按历史 hash 的 git show
@@ -61,31 +68,30 @@ Phase A（仅 setup，不得开始特征挖掘 / trial）：
 3) 阅读并确认边界
 - weather_feature_autoresearch/dig.py（唯一编辑区：FEATURE_SET_NAME + compute_features）
 - prepare.py、run_experiment.sh、append_results_all.py（固定框架与记录口径，除非用户明确要求修 bug，否则不改）
-- 本轮不扩展 LOO/OFO 等消融子流程
 
 4) 运行环境检查
 - 使用 tslib conda 环境（conda activate tslib；仓库根见上文路径）
-- 生成 baseline（建议同时落盘日志）：`python weather_feature_autoresearch/prepare.py --mode baseline --horizons 96 192 336 720 --train-epochs 10 --log-file auto`（日志在 `weather_feature_autoresearch/logs/baseline_<UTC>.log`）
-- 确认 `weather_feature_autoresearch/baselines.json` 各 `pred_len` 下存在 `mse`/`mae`；终端或日志中各 horizon 有 MSE 等可核对输出
+- 生成 baseline（建议同时落盘日志）：`python weather_feature_autoresearch/prepare.py --mode baseline --train-epochs 10 --log-file auto`（默认仅 `pred_len=96`；日志在 `weather_feature_autoresearch/logs/baseline_<UTC>.log`）
+- 确认 `weather_feature_autoresearch/baselines.json` 在 `"96"` 下存在 **`val_mse`**（旧版 test `mse` 需重跑 baseline）
 
 5) 审计文件规则
 - weather_feature_autoresearch/results_all.tsv：每次 trial 运行都要追加一行，禁止 commit
 
 6) setup 完成后先汇报，等待用户确认
-- 必须输出 setup 检查结果（当前分支名、最近 5 条 commit、baselines.json 是否存在及各 horizon baseline MSE 摘要）。
+- 必须输出 setup 检查结果（当前分支名、最近 5 条 commit、baselines.json 是否存在及 `96` 的 baseline **val_mse** 摘要）。
 - 明确询问：是否进入正式实验循环？
 - 在用户未明确回复「开始/继续」前：禁止修改 dig.py 中的特征、禁止运行 bash weather_feature_autoresearch/run_experiment.sh。
 
 Phase B（仅在用户确认后执行）：
 
 7) 进入实验循环
-- 每轮最小单元：bash weather_feature_autoresearch/run_experiment.sh "本轮说明"（可选：--horizons 96 192 336 720 --train-epochs 10 等，同 prepare.py）
+- 每轮最小单元：bash weather_feature_autoresearch/run_experiment.sh "本轮说明"（可选：--train-epochs 10 等，同 prepare.py；默认仅 horizon 96）
 - 每轮必须留下：独立 commit（若有 git）+ `weather_feature_autoresearch/logs/experiment_<UTC>.log`（完整会话输出，由 `prepare.py --log-file` 写入）+ `results_all.tsv` 新增一行
 - 已在 Phase B 内时：应持续多轮尝试，勿在每轮结束再次询问「是否继续」；勿擅自中断整条循环（除非用户明确要求停止）；单次崩溃可修复后重跑该轮；长期无 score 提升应换思路而非死磕同一组特征
 - 仅排障可设 WEATHER_AR_SKIP_ORPHAN_CHECK=1 跳过 run_experiment.sh 的 orphan 校验（平时不要用）
 ```
 
-**补充说明（与脚本一致）**：会话日志统一落在 **`weather_feature_autoresearch/logs/`**（`mkdir -p` 自动创建）。`run_experiment.sh` 会校验当前分支与 `main`/`master` **无共同祖先**（等价于在 orphan 实验线上）；非 git 目录会跳过 commit 与该校验，仍会写日志与 `results_all.tsv`。每次**新会话**应回到 `main` 再按 1) 新建 `autoresearch/<tag>`。若 `run_experiment.sh` 报 `Permission denied`，改用 `bash weather_feature_autoresearch/run_experiment.sh "..."`，或对脚本 `chmod +x`。
+**补充说明（与脚本一致）**：会话日志统一落在 **`weather_feature_autoresearch/logs/`**（`mkdir -p` 自动创建）。`run_experiment.sh` 会拒绝在 `main`/`master` 上运行，并校验当前分支与 `main`/`master` **无共同祖先**（须在 `auto/<tag>` 等 orphan 实验线上）；非 git 目录会跳过 commit 与该校验，仍会写日志与 `results_all.tsv`。每次**新会话**：在 **`autoresearch`（或当前非 main 分支）上**按 1) 创建 `auto/<tag>`，**不要**先 `checkout main`。若 `run_experiment.sh` 报 `Permission denied`，改用 `bash weather_feature_autoresearch/run_experiment.sh "..."`，或对脚本 `chmod +x`。
 
 ---
 
@@ -126,22 +132,21 @@ Phase B（仅在用户确认后执行）：
 
 ## 四、核心目标与 score
 
-对每个 horizon `h ∈ {96,192,336,720}`：
+**开发阶段固定 `pred_len = 96`**（每轮 trial 只训练一次）。**优化目标为验证集**，不用测试集做特征选择。
+
+从 TSLib 训练日志中解析每个 epoch 的 `Vali Loss`（验证集 MSE），取 **最小值** 作为 `trial_val_mse`（与 EarlyStopping 按 val 存 checkpoint 一致）：
 
 ```text
-mse_improve_h = (baseline_mse_h - trial_mse_h) / baseline_mse_h
+val_improve = (baseline_val_mse - trial_val_mse) / baseline_val_mse
+score       = val_improve
 ```
 
-**主分数**：
+- `score > 0`：相对 baseline，验证集 MSE 变好。
+- `score < 0`：验证集变差。
 
-```text
-score = median(mse_improve_96, mse_improve_192, mse_improve_336, mse_improve_720)
-```
+日志末尾的 `test_mse` / `test_mae` **仅作审计参考**，**不参与** `score` 与 keep/discard。
 
-- `score > 0`：多数 horizon 上 MSE 有改善倾向。
-- `score < 0`：整体变差倾向。
-
-`append_results_all.py` 根据历史最优判定 `keep` / `discard`（见第八节）。
+`append_results_all.py` 根据历史最优 `score` 判定 `keep` / `discard`（见第八节）。**测试集**仅在日后对终选特征集做一次性终评（本框架暂不自动跑 final 模式）。
 
 ---
 
@@ -150,13 +155,13 @@ score = median(mse_improve_96, mse_improve_192, mse_improve_336, mse_improve_720
 | 项 | 值 |
 |----|-----|
 | 任务 | `long_term_forecast` |
-| 数据 | `dataset/weather/weather.csv`（baseline）；trial 为 `generated_data/` 下生成 CSV |
+| 数据 | `dataset/weather/weather.csv`（baseline）；trial 写入 **`generated_data/_staging.csv`**（覆盖写，默认跑完删除） |
 | `data` | `custom` |
 | `features` | `M` |
 | `seq_len` | 96 |
 | `label_len` | 48 |
-| `pred_len` | 默认 96/192/336/720（可由 CLI 覆盖） |
-| 模型 | 默认 **`DLinear`**（更快；可用 `--model` 覆盖；**改模型后须重跑 baseline**） |
+| `pred_len` | 默认 **96**（`--horizons` 可覆盖；trial 评分只用第一个 horizon） |
+| 模型 | 默认 **`iTransformer`**（跨变量交互，更适合加列特征；可用 `--model DLinear` 等覆盖；**改模型后须重跑 baseline**） |
 | `e_layers/d_layers/factor` | 3 / 1 / 3 |
 | `d_model/d_ff` | 512 / 512 |
 | trial 输入维 | `21 + 特征数` |
@@ -172,9 +177,9 @@ score = median(mse_improve_96, mse_improve_192, mse_improve_336, mse_improve_720
 | `prepare.py` | **禁止** | 生成数据、调 `run.py`、解析 `mse/mae`、打印 `score` 等键值日志 |
 | `run_experiment.sh` | **禁止**（除非修 bug） | 校验 **orphan 分支**（与 `main`/`master` 无共同祖先）→ commit（若有 git）→ `prepare.py --mode trial` → `append_results_all.py` |
 | `append_results_all.py` | **禁止**（除非修 bug） | 解析日志、追加 `results_all.tsv` |
-| `baselines.json` | 由 `prepare --mode baseline` 写入 | baseline 的 mse/mae |
-| `results_all.tsv` | **只追加、不删改历史行** | 主账；**不要 commit** 到 git（若团队有约定） |
-| `generated_data/*.csv` | 自动生成 | 每轮 trial 的增强表 |
+| `baselines.json` | 由 `prepare --mode baseline` 写入 | 各 horizon 的 **`val_mse`**（及可选 `test_mse` 审计） |
+| `results_all.tsv` | **只追加、不删改历史行** | 主账；**不要 commit** 到 git；**列 schema 已更新**，旧表需归档后重建 |
+| `generated_data/_staging.csv` | 每轮 trial 临时写入 | 默认训练后删除；`--keep-staging` 保留并复制到 `archive/` |
 | `logs/*.log` | 自动生成 | `prepare.py --log-file …` 写入；trial 经 `run_experiment.sh` 为 `experiment_<UTC>.log`，baseline 常用 `baseline_<UTC>.log`（`--log-file auto`） |
 
 ---
@@ -215,17 +220,17 @@ score = median(mse_improve_96, mse_improve_192, mse_improve_336, mse_improve_720
 否则 → status = discard
 ```
 
-默认 `min_improve = 0.001`（0.1%）。覆盖示例：
+默认 **`min_improve = 0`**：只要 `score` 严格高于历史最优即 `keep`，不要求额外相对提升幅度。若日后需要更保守，可显式加大阈值，例如：
 
 ```bash
-python weather_feature_autoresearch/append_results_all.py --log ... --min-improve 0.002
+python weather_feature_autoresearch/append_results_all.py --log ... --min-improve 0.001
 ```
 
 ---
 
 ## 九、命令速查
 
-**Baseline（首次或改 horizon/epoch 后重做）**：
+**Baseline（首次、升级框架后、或改 horizon/epoch/model 后重做）**：
 
 ```bash
 conda activate tslib
@@ -233,7 +238,6 @@ cd /data/nishome/xuhaochen/Time-Series-Library
 
 python weather_feature_autoresearch/prepare.py \
   --mode baseline \
-  --horizons 96 192 336 720 \
   --train-epochs 10 \
   --log-file auto
 ```
@@ -244,7 +248,6 @@ Baseline 的完整训练输出会写入 `weather_feature_autoresearch/logs/basel
 
 ```bash
 bash weather_feature_autoresearch/run_experiment.sh "本轮描述" \
-  --horizons 96 192 336 720 \
   --train-epochs 10
 ```
 
@@ -257,7 +260,7 @@ column -t -s $'\t' weather_feature_autoresearch/results_all.tsv | less -S
 **日志中抽取关键行**：
 
 ```bash
-grep -E "^(feature_set_name|generated_data|input_dim|eval_dims|mse_|mse_improve_|score|positive_horizons|avg_mse_improve):" \
+grep -E "^(feature_set_name|feature_fp|n_features|staging_csv|baseline_val_mse|val_mse|val_improve|score|test_mse):" \
   weather_feature_autoresearch/logs/experiment_*.log | tail -n 50
 ```
 
@@ -265,4 +268,4 @@ grep -E "^(feature_set_name|generated_data|input_dim|eval_dims|mse_|mse_improve_
 
 ## 十、给 agent 的一行摘要
 
-激活 **tslib**，仓库根先完成 **Phase A**：`main` → **`git checkout --orphan autoresearch/<YYYYMMDD-weather>`** → `git reset` → `git add .` → 首 commit；**git log** 遵守硬规则；**baseline** 写好 **`baselines.json`**；**`results_all.tsv` 勿 commit**；汇报后 **等用户「开始/继续」** 再进 **Phase B**。Phase B 内 **`bash weather_feature_autoresearch/run_experiment.sh`**、只改 **`dig.py`**，每轮 **commit + 日志 + TSV 一行**，**持续多轮、勿每轮再问是否继续**；目标 **`score = median(各 horizon mse_improve)`**；不做消融子流程。
+激活 **tslib**，仓库根先完成 **Phase A**：在 **`autoresearch`（勿先切 `main`）** 上 **`git checkout --orphan auto/<YYYYMMDD-weather>`** → 首 commit → baseline；**git log** 遵守硬规则；**`baselines.json` 含 val_mse@96**；**`results_all.tsv` 勿 commit**；汇报后等 **「开始/继续」** 再 **Phase B**（在 **`auto/<tag>`** 上 `run_experiment.sh`，只改 **`dig.py`**）；**score = 验证集相对 baseline 改善 @ pl=96**；**`_staging.csv` 不落盘堆积**。

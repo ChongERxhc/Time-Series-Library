@@ -4,11 +4,12 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,10 +21,29 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "dataset" / "weather"
 GENERATED_DIR = WORK_DIR / "generated_data"
+ARCHIVE_DIR = GENERATED_DIR / "archive"
+STAGING_CSV = GENERATED_DIR / "_staging.csv"
 BASELINES_FILE = WORK_DIR / "baselines.json"
 SENTINEL_THRESHOLD = -1000
 ORIGINAL_DIMS = 21
-DEFAULT_HORIZONS = [96, 192, 336, 720]
+DEFAULT_HORIZON = 96
+DEFAULT_HORIZONS = [DEFAULT_HORIZON]
+
+EPOCH_VALI_RE = re.compile(
+    r"Epoch:\s*\d+,\s*Steps:\s*\d+\s*\|\s*Train Loss:\s*[\d.eE+-]+\s*"
+    r"Vali Loss:\s*([\d.eE+-]+)\s*Test Loss:",
+)
+TEST_METRICS_RE = re.compile(r"mse:([^,\s]+),\s*mae:([^,\s]+)")
+
+
+@dataclass
+class TrialBuildResult:
+    feature_set_name: str
+    feature_fp: str
+    n_features: int
+    input_dim: int
+    staging_path: Path
+    rel_data_path: str
 
 
 class _TeeTextStream:
@@ -109,7 +129,8 @@ def feature_fingerprint(feature_set_name: str, columns: list[str]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:10]
 
 
-def build_trial_dataset() -> tuple[str, Path, int]:
+def build_trial_dataset_staging() -> TrialBuildResult:
+    """Compute features in memory and write a single overwrite staging CSV (scheme A)."""
     dig = load_dig_module()
     feature_set_name = getattr(dig, "FEATURE_SET_NAME", "unnamed_feature_set")
     raw_df = pd.read_csv(DATA_DIR / "weather.csv")
@@ -120,12 +141,49 @@ def build_trial_dataset() -> tuple[str, Path, int]:
     features = features.reset_index(drop=True)
     trial_df = pd.concat([raw_df.reset_index(drop=True), features], axis=1)
     input_dim = len([col for col in trial_df.columns if col != "date"])
+    fp = feature_fingerprint(feature_set_name, list(features.columns))
 
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    fp = feature_fingerprint(feature_set_name, list(features.columns))
-    output_path = GENERATED_DIR / f"{feature_set_name}_{fp}.csv"
-    trial_df.to_csv(output_path, index=False)
-    return feature_set_name, output_path, input_dim
+    trial_df.to_csv(STAGING_CSV, index=False)
+    rel_data_path = os.path.relpath(STAGING_CSV, DATA_DIR)
+
+    return TrialBuildResult(
+        feature_set_name=feature_set_name,
+        feature_fp=fp,
+        n_features=len(features.columns),
+        input_dim=input_dim,
+        staging_path=STAGING_CSV,
+        rel_data_path=rel_data_path,
+    )
+
+
+def remove_staging(staging_path: Path) -> None:
+    if staging_path.exists():
+        staging_path.unlink()
+
+
+def archive_staging(meta: TrialBuildResult) -> Path:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = ARCHIVE_DIR / f"{meta.feature_set_name}_{meta.feature_fp}.csv"
+    shutil.copy2(meta.staging_path, dest)
+    return dest
+
+
+def parse_best_val_mse(stdout: str) -> float:
+    losses = [float(m.group(1)) for m in EPOCH_VALI_RE.finditer(stdout)]
+    if not losses:
+        raise RuntimeError(
+            "Cannot parse Vali Loss from TSLib log; expected lines like "
+            "'Epoch: N, Steps: M | Train Loss: ... Vali Loss: ... Test Loss: ...'"
+        )
+    return float(min(losses))
+
+
+def parse_test_metrics(stdout: str) -> tuple[float | None, float | None]:
+    match = TEST_METRICS_RE.search(stdout)
+    if not match:
+        return None, None
+    return float(match.group(1)), float(match.group(2))
 
 
 def run_tslib_experiment(
@@ -141,7 +199,7 @@ def run_tslib_experiment(
     model: str,
     cuda_visible_devices: str,
     des: str,
-) -> tuple[float, float]:
+) -> str:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     cmd = [
@@ -212,18 +270,28 @@ def run_tslib_experiment(
     print(proc.stdout)
     if proc.returncode != 0:
         raise RuntimeError(f"TSLib run failed for pred_len={pred_len} with code {proc.returncode}")
-
-    match = re.search(r"mse:([^,\s]+),\s*mae:([^,\s]+)", proc.stdout)
-    if not match:
-        raise RuntimeError(f"Cannot parse mse/mae for pred_len={pred_len}")
-    return float(match.group(1)), float(match.group(2))
+    return proc.stdout
 
 
 def load_baselines(path: Path) -> dict[str, dict[str, float]]:
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = json.load(f)
+    out: dict[str, dict[str, float]] = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        if "val_mse" in entry:
+            out[key] = entry
+        elif "mse" in entry:
+            raise RuntimeError(
+                f"baselines.json[{key}] uses legacy test 'mse'; rerun: "
+                f"python weather_feature_autoresearch/prepare.py --mode baseline"
+            )
+        else:
+            raise RuntimeError(f"invalid baseline entry for horizon {key}: {entry}")
+    return out
 
 
 def save_baselines(path: Path, baselines: dict[str, dict[str, float]]) -> None:
@@ -232,99 +300,149 @@ def save_baselines(path: Path, baselines: dict[str, dict[str, float]]) -> None:
         f.write("\n")
 
 
-def median(values: list[float]) -> float:
-    return float(np.median(np.asarray(values, dtype="float64")))
+def baseline_val_mse(baselines: dict[str, dict[str, float]], horizon: int) -> float:
+    key = str(horizon)
+    if key not in baselines:
+        raise KeyError(key)
+    return float(baselines[key]["val_mse"])
 
 
 def print_kv(key: str, value) -> None:
     print(f"{key}: {value}")
 
 
+def run_horizon_experiment(
+    args: argparse.Namespace,
+    *,
+    horizon: int,
+    data_path: str,
+    input_dim: int,
+    eval_dims: int,
+    model_id: str,
+    des: str,
+) -> tuple[float, float | None, float | None]:
+    stdout = run_tslib_experiment(
+        data_path=data_path,
+        model_id=model_id,
+        input_dim=input_dim,
+        pred_len=horizon,
+        train_epochs=args.train_epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        eval_dims=eval_dims,
+        model=args.model,
+        cuda_visible_devices=args.cuda_visible_devices,
+        des=des,
+    )
+    val_mse = parse_best_val_mse(stdout)
+    test_mse, test_mae = parse_test_metrics(stdout)
+    return val_mse, test_mse, test_mae
+
+
 def run_baseline(args: argparse.Namespace) -> None:
-    baselines = load_baselines(args.baselines)
+    # Fresh write: do not load legacy baselines.json (old test-mse format would block rerun).
+    baselines: dict[str, dict[str, float]] = {}
     for horizon in args.horizons:
-        mse, mae = run_tslib_experiment(
+        val_mse, test_mse, test_mae = run_horizon_experiment(
+            args,
+            horizon=horizon,
             data_path="weather.csv",
-            model_id=f"weather_{args.model}_baseline_pl{horizon}_ep{args.train_epochs}",
             input_dim=ORIGINAL_DIMS,
-            pred_len=horizon,
-            train_epochs=args.train_epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
             eval_dims=0,
-            model=args.model,
-            cuda_visible_devices=args.cuda_visible_devices,
+            model_id=f"weather_{args.model}_baseline_pl{horizon}_ep{args.train_epochs}",
             des=f"AutoResearchBaseline_pl{horizon}",
         )
-        baselines[str(horizon)] = {"mse": mse, "mae": mae}
-        print_kv(f"baseline_mse_{horizon}", mse)
-        print_kv(f"baseline_mae_{horizon}", mae)
+        entry: dict[str, float] = {"val_mse": val_mse}
+        if test_mse is not None:
+            entry["test_mse"] = test_mse
+        if test_mae is not None:
+            entry["test_mae"] = test_mae
+        baselines[str(horizon)] = entry
+        print_kv(f"baseline_val_mse_{horizon}", val_mse)
+        if test_mse is not None:
+            print_kv(f"baseline_test_mse_{horizon}", test_mse)
+        if test_mae is not None:
+            print_kv(f"baseline_test_mae_{horizon}", test_mae)
     save_baselines(args.baselines, baselines)
     print_kv("baseline_file", args.baselines)
+    print_kv("pred_len", args.horizons[0] if len(args.horizons) == 1 else args.horizons)
 
 
 def run_trial(args: argparse.Namespace) -> None:
     baselines = load_baselines(args.baselines)
+    horizon = args.horizons[0]
+    if len(args.horizons) != 1:
+        raise RuntimeError(
+            f"trial mode expects a single horizon for scoring; got {args.horizons}. "
+            "Use --horizons 96 (default)."
+        )
     missing = [h for h in args.horizons if str(h) not in baselines]
     if missing:
         raise RuntimeError(f"missing baselines for horizons {missing}; run --mode baseline first")
 
-    feature_set_name, dataset_path, input_dim = build_trial_dataset()
-    rel_data_path = os.path.relpath(dataset_path, DATA_DIR)
-    improvements: list[float] = []
-    mae_improvements: list[float] = []
-
-    print_kv("feature_set_name", feature_set_name)
-    print_kv("generated_data", dataset_path)
-    print_kv("input_dim", input_dim)
+    meta = build_trial_dataset_staging()
+    print_kv("feature_set_name", meta.feature_set_name)
+    print_kv("feature_fp", meta.feature_fp)
+    print_kv("n_features", meta.n_features)
+    print_kv("input_dim", meta.input_dim)
     print_kv("eval_dims", ORIGINAL_DIMS)
+    print_kv("staging_csv", meta.rel_data_path)
+    print_kv("pred_len", horizon)
 
-    for horizon in args.horizons:
-        mse, mae = run_tslib_experiment(
-            data_path=rel_data_path,
-            model_id=f"weather_{args.model}_{feature_set_name}_pl{horizon}_ep{args.train_epochs}",
-            input_dim=input_dim,
-            pred_len=horizon,
-            train_epochs=args.train_epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
+    try:
+        val_mse, test_mse, test_mae = run_horizon_experiment(
+            args,
+            horizon=horizon,
+            data_path=meta.rel_data_path,
+            input_dim=meta.input_dim,
             eval_dims=ORIGINAL_DIMS,
-            model=args.model,
-            cuda_visible_devices=args.cuda_visible_devices,
-            des=f"AutoResearchTrial_{feature_set_name}_pl{horizon}",
+            model_id=f"weather_{args.model}_{meta.feature_set_name}_pl{horizon}_ep{args.train_epochs}",
+            des=f"AutoResearchTrial_{meta.feature_set_name}_pl{horizon}",
         )
-        base = baselines[str(horizon)]
-        mse_improve = (base["mse"] - mse) / base["mse"]
-        mae_improve = (base["mae"] - mae) / base["mae"]
-        improvements.append(float(mse_improve))
-        mae_improvements.append(float(mae_improve))
+    finally:
+        if not args.keep_staging:
+            remove_staging(meta.staging_path)
 
-        print_kv(f"mse_{horizon}", mse)
-        print_kv(f"mae_{horizon}", mae)
-        print_kv(f"mse_improve_{horizon}", mse_improve)
-        print_kv(f"mae_improve_{horizon}", mae_improve)
+    base_val = baseline_val_mse(baselines, horizon)
+    val_improve = (base_val - val_mse) / base_val
+    score = float(val_improve)
 
-    score = median(improvements)
-    avg_mse_improve = float(np.mean(improvements))
-    avg_mae_improve = float(np.mean(mae_improvements))
-    positive_horizons = int(sum(v > 0 for v in improvements))
-
+    print_kv("baseline_val_mse", base_val)
+    print_kv("val_mse", val_mse)
+    print_kv("val_improve", val_improve)
+    if test_mse is not None:
+        print_kv("test_mse", test_mse)
+    if test_mae is not None:
+        print_kv("test_mae", test_mae)
     print_kv("score", score)
-    print_kv("avg_mse_improve", avg_mse_improve)
-    print_kv("avg_mae_improve", avg_mae_improve)
-    print_kv("positive_horizons", positive_horizons)
+
+    if args.keep_staging and meta.staging_path.exists():
+        archived = archive_staging(meta)
+        print_kv("archived_csv", os.path.relpath(archived, WORK_DIR))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weather feature autoresearch runner.")
     parser.add_argument("--mode", choices=["baseline", "trial"], default="trial")
-    parser.add_argument("--horizons", type=int, nargs="+", default=DEFAULT_HORIZONS)
+    parser.add_argument(
+        "--horizons",
+        type=int,
+        nargs="+",
+        default=DEFAULT_HORIZONS,
+        help="Prediction lengths; trial scoring uses the first (default: 96 only).",
+    )
     parser.add_argument("--baselines", type=Path, default=BASELINES_FILE)
-    parser.add_argument("--model", default="DLinear")
+    parser.add_argument("--model", default="iTransformer")
     parser.add_argument("--train-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.0001)
     parser.add_argument("--cuda-visible-devices", default="0")
+    parser.add_argument(
+        "--keep-staging",
+        action="store_true",
+        help="Keep generated_data/_staging.csv after trial (default: delete). "
+        "If set, also copy to generated_data/archive/ for the trial.",
+    )
     parser.add_argument(
         "--log-file",
         default=None,

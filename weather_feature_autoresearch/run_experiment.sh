@@ -13,13 +13,23 @@ PREPARE_ARGS=("$@")
 mkdir -p logs
 TS="logs/experiment_$(date -u +%Y%m%dT%H%M%SZ).log"
 
-# 必须在 orphan 实验分支上运行（与 main/master 无共同祖先）。排障：WEATHER_AR_SKIP_ORPHAN_CHECK=1
+# 须在 orphan 实验分支上运行（非 main/master，且与 main/master 无共同祖先）。排障：WEATHER_AR_SKIP_ORPHAN_CHECK=1
 if [ -z "${WEATHER_AR_SKIP_ORPHAN_CHECK:-}" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+  current="$(git branch --show-current 2>/dev/null || true)"
+  case "$current" in
+    main|master)
+      echo "weather_feature_autoresearch: 当前在 '$current'，禁止在此跑 trial。" >&2
+      echo "请先 checkout autoresearch（或上一实验分支），再按 program.md 创建 auto/<tag> orphan；" >&2
+      echo "创建 orphan 前不要先 checkout main/master。" >&2
+      echo "（仅排障可设 WEATHER_AR_SKIP_ORPHAN_CHECK=1）" >&2
+      exit 1
+      ;;
+  esac
   for base in main master; do
     if git show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then
       if git merge-base HEAD "$base" >/dev/null 2>&1; then
-        echo "weather_feature_autoresearch: 当前分支与 '$base' 存在共同祖先，不符合要求。" >&2
-        echo "请先在 main 上执行: git checkout --orphan <唯一分支名>，再 git add -A && git commit，然后在本分支跑 trial。" >&2
+        echo "weather_feature_autoresearch: 当前分支 '${current:-HEAD}' 与 '$base' 存在共同祖先，不符合 orphan 实验线。" >&2
+        echo "请按 program.md Phase A：在 autoresearch（勿先切 main）上执行 git checkout --orphan auto/<tag>，再跑 baseline/trial。" >&2
         echo "（仅排障可设 WEATHER_AR_SKIP_ORPHAN_CHECK=1）" >&2
         exit 1
       fi
