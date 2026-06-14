@@ -38,15 +38,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _original_7_channel_indices(self, n_channels: int) -> list[int]:
+        if self.args.features == 'MS' or n_channels <= 7:
+            return list(range(n_channels))
+        return [0, 1, 2, 3, 4, 5, n_channels - 1]
+
+    def _eval_channel_indices(self, n_channels: int) -> list[int]:
+        eval_original_7 = getattr(self.args, 'eval_original_7', 0)
+        if eval_original_7 and self.args.features != 'MS' and n_channels > 7:
+            return self._original_7_channel_indices(n_channels)
+        eval_dims = getattr(self.args, 'eval_dims', 0)
+        if eval_dims > 0 and self.args.features != 'MS':
+            return list(range(eval_dims))
+        return list(range(n_channels))
+
     def _select_output_dims(self, outputs, batch_y):
         f_dim = -1 if self.args.features == 'MS' else 0
         outputs = outputs[:, -self.args.pred_len:, f_dim:]
         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-        eval_dims = getattr(self.args, 'eval_dims', 0)
-        if eval_dims > 0 and self.args.features != 'MS':
-            outputs = outputs[:, :, :eval_dims]
-            batch_y = batch_y[:, :, :eval_dims]
+        idx = self._eval_channel_indices(outputs.shape[-1])
+        if len(idx) < outputs.shape[-1]:
+            outputs = outputs[:, :, idx]
+            batch_y = batch_y[:, :, idx]
         return outputs, batch_y
 
     def _select_output_dims_np(self, outputs, batch_y):
@@ -54,13 +68,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         outputs = outputs[:, :, f_dim:]
         batch_y = batch_y[:, :, f_dim:]
 
-        eval_dims = getattr(self.args, 'eval_dims', 0)
-        if eval_dims > 0 and self.args.features != 'MS':
-            outputs = outputs[:, :, :eval_dims]
-            batch_y = batch_y[:, :, :eval_dims]
+        idx = self._eval_channel_indices(outputs.shape[-1])
+        if len(idx) < outputs.shape[-1]:
+            outputs = outputs[:, :, idx]
+            batch_y = batch_y[:, :, idx]
         return outputs, batch_y
 
-    def vali(self, vali_data, vali_loader, criterion):
+    def _vali_with_indices(self, vali_loader, criterion, channel_indices: list[int]):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
@@ -71,26 +85,30 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                outputs, batch_y = self._select_output_dims(outputs, batch_y)
 
-                pred = outputs.detach()
-                true = batch_y.detach()
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                if len(channel_indices) < outputs.shape[-1]:
+                    outputs = outputs[:, :, channel_indices]
+                    batch_y = batch_y[:, :, channel_indices]
 
-                loss = criterion(pred, true)
-
+                loss = criterion(outputs.detach(), batch_y.detach())
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
+
+    def vali(self, vali_data, vali_loader, criterion):
+        idx = self._eval_channel_indices(vali_data.data_y.shape[-1])
+        return self._vali_with_indices(vali_loader, criterion, idx)
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -180,6 +198,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
+
+        score_original_7 = getattr(self.args, 'score_original_7', 0)
+        if score_original_7 and self.args.features != 'MS':
+            n_channels = vali_data.data_y.shape[-1]
+            if n_channels > 7:
+                score_idx = self._original_7_channel_indices(n_channels)
+                score_val_loss = self._vali_with_indices(vali_loader, criterion, score_idx)
+                print("Score Vali Loss: {:.7f}".format(score_val_loss))
 
         return self.model
 
@@ -271,6 +297,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             dtw = 'Not calculated'
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
+        score_original_7 = getattr(self.args, 'score_original_7', 0)
+        if score_original_7 and self.args.features != 'MS':
+            n_channels = preds.shape[-1]
+            if n_channels > 7:
+                score_idx = self._original_7_channel_indices(n_channels)
+                score_mae, score_mse, _, _, _ = metric(
+                    preds[:, :, score_idx], trues[:, :, score_idx]
+                )
+                print("Score Test Loss: {:.7f}".format(score_mse))
+                print("Score Test MAE: {:.7f}".format(score_mae))
         print('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")

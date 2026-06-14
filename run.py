@@ -41,6 +41,10 @@ if __name__ == '__main__':
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--eval_dims', type=int, default=0,
                         help='only train/evaluate the first N output dimensions when > 0')
+    parser.add_argument('--eval_original_7', type=int, default=0,
+                        help='evaluate 6 load channels + OT (last channel) when enc_in>7')
+    parser.add_argument('--score_original_7', type=int, default=0,
+                        help='after training on all channels, report val MSE on original 7 dims only')
 
     # inputation task
     parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
