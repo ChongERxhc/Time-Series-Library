@@ -151,7 +151,7 @@ if __name__ == '__main__':
     parser.add_argument('--skip_channel', type=int, default=32, help='')
 
     parser.add_argument('--individual', action='store_true', default=False,
-                        help='DLinear: a linear layer for each variate(channel) individually')
+                        help='Linear/NLinear/DLinear: one linear head per channel instead of shared weights')
 
     # TimeFilter
     parser.add_argument('--alpha', type=float, default=0.1, help='KNN for Graph Construction')

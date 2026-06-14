@@ -9,10 +9,7 @@ class Model(nn.Module):
     Paper link: https://arxiv.org/pdf/2205.13504.pdf
     """
 
-    def __init__(self, configs, individual=False):
-        """
-        individual: Bool, whether shared model among different variates.
-        """
+    def __init__(self, configs):
         super(Model, self).__init__()
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
@@ -22,7 +19,7 @@ class Model(nn.Module):
             self.pred_len = configs.pred_len
         # Series decomposition block from Autoformer
         self.decompsition = series_decomp(configs.moving_avg)
-        self.individual = individual
+        self.individual = getattr(configs, 'individual', False)
         self.channels = configs.enc_in
 
         if self.individual:
